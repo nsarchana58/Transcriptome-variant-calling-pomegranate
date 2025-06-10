@@ -1,0 +1,113 @@
+#!/bin/bash
+# “TRANSCRIPTOME-WIDE VARIANT CALLING IN PUNICA GRANATUM: A BIOINFORMATICS APPROACH TO GENETIC DIVERSITY AND RNA EDITING” - Pipeline
+# Author: Archana NS
+# Tools Used: FastQC, Trimmomatic, HISAT2, SAMtools, GATK HaplotypeCaller, SnpEff, REDItools2, VCFtools, Blast2GO
+
+# 1. Setup Environment
+mkdir -p Project/RawData Project/QC Project/Trimmed Project/Aligned Project/BAM Project/VCF Project/Annotation Project/Editing
+
+# 2. Step 1: Data Acquisition
+# Download raw RNA-Seq data (paired-end)
+# Example using fasterq-dump (not showing specific IDs)
+# for SAMPLE in $(cat sample_list.txt); do
+#     fasterq-dump $SAMPLE -O Project/RawData
+# done
+
+# 3. Step 2: Quality Control with FastQC
+fastqc Project/RawData/*.fastq -o Project/QC
+
+# 4. Step 3: Read Trimming with Trimmomatic
+for fq1 in Project/RawData/*_1.fastq; do
+    fq2="${fq1/_1.fastq/_2.fastq}"
+    out1="Project/Trimmed/$(basename $fq1 .fastq)_paired.fastq"
+    out2="Project/Trimmed/$(basename $fq2 .fastq)_paired.fastq"
+    un1="Project/Trimmed/$(basename $fq1 .fastq)_unpaired.fastq"
+    un2="Project/Trimmed/$(basename $fq2 .fastq)_unpaired.fastq"
+    
+    trimmomatic PE -threads 8 \
+      $fq1 $fq2 $out1 $un1 $out2 $un2 \
+      ILLUMINACLIP:TruSeq3-PE.fa:2:30:10 SLIDINGWINDOW:4:20 MINLEN:50
+done
+
+# 5. Step 4: Reference Genome Preparation
+hisat2-build pomegranate_genome.fa Project/reference_index/genome_index
+
+# 6. Step 5: Alignment with HISAT2
+for fq1 in Project/Trimmed/*_1_paired.fastq; do
+    fq2="${fq1/_1_paired.fastq/_2_paired.fastq}"
+    sample=$(basename $fq1 _1_paired.fastq)
+    hisat2 -x Project/reference_index/genome_index \
+           -1 $fq1 -2 $fq2 \
+           -S Project/Aligned/${sample}.sam \
+           --dta -p 8
+done
+
+# 7. Step 6: Convert SAM to BAM, sort and index
+for sam in Project/Aligned/*.sam; do
+    base=$(basename $sam .sam)
+    samtools view -@ 8 -bS $sam | \
+    samtools sort -@ 8 -o Project/BAM/${base}_sorted.bam
+    samtools index Project/BAM/${base}_sorted.bam
+done
+
+# 8. Step 7: Variant Calling with GATK HaplotypeCaller
+for bam in Project/BAM/*_sorted.bam; do
+    sample=$(basename $bam _sorted.bam)
+    gatk HaplotypeCaller \
+      -R pomegranate_genome.fa \
+      -I $bam \
+      -O Project/VCF/${sample}.g.vcf.gz \
+      -ERC GVCF
+done
+
+# 9. Step 8: Joint Genotyping (if multiple samples)
+gatk CombineGVCFs \
+  -R pomegranate_genome.fa \
+  --variant Project/VCF/sample1.g.vcf.gz \
+  --variant Project/VCF/sample2.g.vcf.gz \
+  --output Project/VCF/combined.g.vcf.gz
+
+gatk GenotypeGVCFs \
+  -R pomegranate_genome.fa \
+  -V Project/VCF/combined.g.vcf.gz \
+  -O Project/VCF/final_variants.vcf.gz
+
+# 10. Step 9: Variant Filtering 
+gatk VariantFiltration \
+  -R pomegranate_genome.fa \
+  -V Project/VCF/final_variants.vcf.gz \
+  -O Project/VCF/filtered_variants.vcf.gz \
+  --filter-expression "QD < 2.0 || FS > 60.0" \
+  --filter-name "basic_snp_filter"
+
+# 11. Step 10: Annotation using SnpEff
+# Create or download the pomegranate-specific SnpEff database beforehand
+snpEff -v punica_granatum_db Project/VCF/filtered_variants.vcf.gz > Project/Annotation/annotated_variants.vcf
+
+# 12. Step 11: RNA Editing Detection using REDItools2
+# Preprocess: Sort, index, and reformat BAM
+# REDItools2 requires the reference genome and aligned RNA-Seq BAM files
+# REDItools2 example command:
+for bam in Project/BAM/*_sorted.bam; do
+    sample=$(basename $bam _sorted.bam)
+    python REDItoolDnaRna.py \
+      -i $bam \
+      -f pomegranate_genome.fa \
+      -o Project/Editing/${sample}_RNA_editing.tsv \
+      -t 8 \
+      -m 20 \
+      -q 25 \
+      -e -u
+done
+
+# 13. Step 12: Functional Annotation and GO using Blast2GO 
+# Export the high/moderate impact variant gene IDs from SnpEff
+# Upload them to Blast2GO for GO term mapping and EC number distribution
+# Perform InterProScan and KEGG annotation in Blast2GO
+
+# 14. Step 13: Genetic Diversity with VCFtools
+vcftools --gzvcf Project/VCF/filtered_variants.vcf.gz \
+         --out Project/VCF/diversity_stats \
+         --depth --site-mean-depth --site-quality --het --missing-indv
+
+
